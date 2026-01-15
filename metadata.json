@@ -1,0 +1,7 @@
+{
+  "name": "VOICE PHAN BÌNH",
+  "description": "Một công cụ chuyển đổi văn bản thành giọng nói (TTS) mạnh mẽ sử dụng công nghệ Google Gemini AI, hỗ trợ lên đến 20.000 ký tự mỗi lần yêu cầu với nhiều giọng nói chất lượng cao.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
