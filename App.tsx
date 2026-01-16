@@ -10,9 +10,6 @@ import * as Storage from './utils/storage';
 const MAX_CHARS = 20000;
 const CHUNK_SIZE = 3000;
 
-/**
- * Hàm hỗ trợ chia nhỏ văn bản dựa trên dấu câu để không ngắt quãng lời nói
- */
 function splitTextIntoChunks(text: string, maxSize: number): string[] {
   const chunks: string[] = [];
   let currentText = text;
@@ -60,8 +57,14 @@ const App: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [mergedAudioUrl, setMergedAudioUrl] = useState<string | null>(null);
   const [lastBatchCount, setLastBatchCount] = useState<number>(0);
+  const [lastBatchIds, setLastBatchIds] = useState<string[]>([]);
+  
+  // States for specific item regeneration
+  const [regeneratingId, setRegeneratingId] = useState<string | null>(null);
+  const [regenProgress, setRegenProgress] = useState(0);
   
   const progressIntervalRef = useRef<number | null>(null);
+  const regenIntervalRef = useRef<number | null>(null);
   const isAbortedRef = useRef<boolean>(false);
 
   const charCount = inputText.length;
@@ -95,18 +98,18 @@ const App: React.FC = () => {
     };
   }, []);
 
+  // Main generator progress handler
   useEffect(() => {
-    if (isLoading && !isMerging) {
+    if (isLoading && !isMerging && !regeneratingId) {
       setProgress(1);
-      const stepTime = 300; 
       progressIntervalRef.current = window.setInterval(() => {
         setProgress(prev => {
           if (prev >= 98) return prev;
           const increment = prev < 70 ? (Math.random() * 8 + 3) : (Math.random() * 2 + 0.1);
           return parseFloat((prev + increment).toFixed(1));
         });
-      }, stepTime);
-    } else if (!isLoading && !isMerging) {
+      }, 300);
+    } else if (!isLoading && !isMerging && !regeneratingId) {
       if (progressIntervalRef.current) clearInterval(progressIntervalRef.current);
       if (progress > 0 && !isAbortedRef.current) setProgress(100);
       const timer = setTimeout(() => {
@@ -117,14 +120,36 @@ const App: React.FC = () => {
     return () => {
       if (progressIntervalRef.current) clearInterval(progressIntervalRef.current);
     };
-  }, [isLoading, isMerging]);
+  }, [isLoading, isMerging, regeneratingId]);
+
+  // Specific item regeneration progress handler
+  useEffect(() => {
+    if (regeneratingId) {
+      setRegenProgress(1);
+      regenIntervalRef.current = window.setInterval(() => {
+        setRegenProgress(prev => {
+          if (prev >= 96) return prev;
+          const increment = prev < 60 ? (Math.random() * 10 + 5) : (Math.random() * 3 + 1);
+          return Math.min(99, prev + increment);
+        });
+      }, 200);
+    } else {
+      if (regenIntervalRef.current) clearInterval(regenIntervalRef.current);
+      setRegenProgress(0);
+    }
+    return () => {
+      if (regenIntervalRef.current) clearInterval(regenIntervalRef.current);
+    };
+  }, [regeneratingId]);
 
   const handleStop = () => {
     isAbortedRef.current = true;
     setIsLoading(false);
     setIsMerging(false);
+    setRegeneratingId(null);
     setCurrentPartInfo(null);
     if (progressIntervalRef.current) clearInterval(progressIntervalRef.current);
+    if (regenIntervalRef.current) clearInterval(regenIntervalRef.current);
   };
 
   const performMerge = async (items: AudioItem[]): Promise<string> => {
@@ -138,7 +163,6 @@ const App: React.FC = () => {
       const arrayBuffer = await response.arrayBuffer();
       const buffer = await audioContext.decodeAudioData(arrayBuffer);
       buffers.push(buffer);
-      setProgress(Math.floor(10 + (i / sortedItems.length) * 80));
     }
     
     const mergedBuffer = mergeAudioBuffers(buffers, audioContext);
@@ -188,7 +212,7 @@ const App: React.FC = () => {
         });
 
         const id = Math.random().toString(36).substring(2, 9);
-        const timestamp = Date.now();
+        const timestamp = Date.now() + i; 
         
         const displayLabel = totalChunks > 1 ? `[Phần ${i + 1}/${totalChunks}] ` : '';
         const itemText = displayLabel + currentText;
@@ -215,11 +239,10 @@ const App: React.FC = () => {
         setHistory(prev => [newItem, ...prev]);
         
         if (i < totalChunks - 1) {
-          await new Promise(r => setTimeout(r, 1000));
+          await new Promise(r => setTimeout(r, 800));
         }
       }
       
-      // Tự động nối các phần nếu có từ 2 phần trở lên
       if (!isAbortedRef.current && totalChunks > 1) {
         setIsMerging(true);
         setCurrentPartInfo(null);
@@ -227,6 +250,7 @@ const App: React.FC = () => {
         const url = await performMerge(sessionItems);
         setMergedAudioUrl(url);
         setLastBatchCount(totalChunks);
+        setLastBatchIds(sessionItems.map(item => item.id));
         setProgress(100);
       }
     } catch (err: any) {
@@ -239,6 +263,65 @@ const App: React.FC = () => {
     }
   };
 
+  const handleRegenerate = async (item: AudioItem) => {
+    if (isLoading || isMerging || regeneratingId) return;
+    
+    setRegeneratingId(item.id);
+    setError(null);
+    isAbortedRef.current = false;
+
+    try {
+      const cleanText = item.text.replace(/^\[Phần \d+\/\d+\] /, '');
+      const { audioBuffer } = await generateTTS(cleanText, item.voice);
+      
+      const wavBlob = audioBufferToWav(audioBuffer);
+      const audioUrl = URL.createObjectURL(wavBlob);
+      
+      const reader = new FileReader();
+      const base64Data = await new Promise<string>((resolve) => {
+        reader.onloadend = () => resolve((reader.result as string).split(',')[1]);
+        reader.readAsDataURL(wavBlob);
+      });
+
+      const updatedItem: AudioItem = {
+        ...item,
+        audioUrl,
+        duration: audioBuffer.duration
+      };
+
+      await Storage.saveItem({
+        id: item.id,
+        text: item.text,
+        voice: item.voice,
+        timestamp: item.timestamp,
+        duration: audioBuffer.duration,
+        base64Data
+      });
+
+      setRegenProgress(100);
+      setHistory(prev => prev.map(h => h.id === item.id ? updatedItem : h));
+
+      // Re-trigger auto-merge if this item is part of the current session batch
+      if (lastBatchIds.includes(item.id)) {
+        setIsMerging(true);
+        // Get latest history from state
+        setHistory(currentHistory => {
+          const itemsToMerge = currentHistory.filter(h => lastBatchIds.includes(h.id));
+          performMerge(itemsToMerge).then(url => {
+            setMergedAudioUrl(url);
+            setIsMerging(false);
+          });
+          return currentHistory;
+        });
+      }
+      
+      setTimeout(() => setRegeneratingId(null), 600);
+    } catch (err: any) {
+      setError("Lỗi khi tạo lại phần này: " + err.message);
+      setRegeneratingId(null);
+    }
+  };
+
   const handleDelete = useCallback(async (id: string) => {
     try {
       await Storage.deleteItem(id);
@@ -247,10 +330,14 @@ const App: React.FC = () => {
         if (item) URL.revokeObjectURL(item.audioUrl);
         return prev.filter(i => i.id !== id);
       });
+      if (lastBatchIds.includes(id)) {
+        setMergedAudioUrl(null);
+        setLastBatchIds(prev => prev.filter(bid => bid !== id));
+      }
     } catch (err) {
       console.error("Failed to delete item:", err);
     }
-  }, []);
+  }, [lastBatchIds]);
 
   const handleClearHistory = async () => {
     if (window.confirm("Bạn có chắc chắn muốn xóa toàn bộ lịch sử?")) {
@@ -261,6 +348,7 @@ const App: React.FC = () => {
           return [];
         });
         setMergedAudioUrl(null);
+        setLastBatchIds([]);
       } catch (err) {
         console.error("Failed to clear history:", err);
       }
@@ -285,7 +373,7 @@ const App: React.FC = () => {
   const handleDownloadMerged = (url: string) => {
     const link = document.createElement('a');
     link.href = url;
-    link.download = `voice-full-merged-${Date.now()}.wav`;
+    link.download = `voice-studio-full-${Date.now()}.wav`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -349,11 +437,11 @@ const App: React.FC = () => {
               </div>
 
               <div className="flex flex-col justify-end">
-                {(isLoading || isMerging) && (
+                {(isLoading || isMerging) && !regeneratingId && (
                    <div className="mb-3 bg-slate-950/50 p-3 rounded-2xl border border-indigo-500/20">
                      <div className="flex justify-between items-center mb-1.5">
                        <span className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest">
-                         {isMerging ? 'Đang nối các phần...' : (currentPartInfo ? `Đang tạo Phần ${currentPartInfo.current}/${currentPartInfo.total}` : 'Đang xử lý...')}
+                         {isMerging ? 'Đang cập nhật bản đầy đủ...' : (currentPartInfo ? `Đang tạo Phần ${currentPartInfo.current}/${currentPartInfo.total}` : 'Đang xử lý...')}
                        </span>
                        <span className="text-sm font-mono font-bold text-indigo-400">
                          {progress}%
@@ -371,9 +459,9 @@ const App: React.FC = () => {
                 <div className="flex space-x-2">
                   <button
                     onClick={handleGenerate}
-                    disabled={isLoading || isMerging || !inputText.trim() || isOverLimit}
+                    disabled={isLoading || isMerging || !!regeneratingId || !inputText.trim() || isOverLimit}
                     className={`flex-1 py-4 rounded-2xl font-bold flex items-center justify-center space-x-2 transition-all shadow-xl ${
-                      isLoading || isMerging || !inputText.trim() || isOverLimit
+                      isLoading || isMerging || regeneratingId || !inputText.trim() || isOverLimit
                         ? 'bg-slate-800 text-slate-600 cursor-not-allowed shadow-none'
                         : 'gradient-bg text-white hover:brightness-110 hover:scale-[1.01] active:scale-[0.99] shadow-indigo-500/10'
                     }`}
@@ -397,7 +485,7 @@ const App: React.FC = () => {
                     )}
                   </button>
 
-                  {(isLoading || isMerging) && (
+                  {(isLoading || isMerging || !!regeneratingId) && (
                     <button
                       onClick={handleStop}
                       className="px-6 rounded-2xl bg-red-500/10 border border-red-500/30 text-red-500 font-bold hover:bg-red-500/20 transition-all flex items-center justify-center"
@@ -413,7 +501,7 @@ const App: React.FC = () => {
             </div>
 
             {mergedAudioUrl && (
-              <div className="mt-4 p-4 bg-emerald-500/10 border border-emerald-500/30 rounded-2xl flex items-center justify-between animate-fade-in">
+              <div className="mt-4 p-4 bg-emerald-500/10 border border-emerald-500/30 rounded-2xl flex items-center justify-between animate-fade-in ring-1 ring-emerald-500/20">
                 <div className="flex items-center space-x-3">
                   <div className="w-10 h-10 rounded-full bg-emerald-500 flex items-center justify-center shadow-lg shadow-emerald-500/20">
                     <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -421,8 +509,8 @@ const App: React.FC = () => {
                     </svg>
                   </div>
                   <div>
-                    <h4 className="text-sm font-bold text-emerald-100">Đã nối xong {lastBatchCount} phần!</h4>
-                    <p className="text-[10px] text-emerald-300 uppercase tracking-widest font-bold">Bản đầy đủ đã sẵn sàng tải về</p>
+                    <h4 className="text-sm font-bold text-emerald-100">Cập nhật bản đầy đủ ({lastBatchCount} phần)</h4>
+                    <p className="text-[10px] text-emerald-300 uppercase tracking-widest font-bold">Bản nối mới nhất đã sẵn sàng</p>
                   </div>
                 </div>
                 <button 
@@ -450,7 +538,7 @@ const App: React.FC = () => {
 
         <section className="lg:col-span-5 flex flex-col">
           <div className="flex items-center justify-between mb-4">
-            <h2 className="text-lg font-bold text-slate-100">Lịch sử (Đã lưu)</h2>
+            <h2 className="text-lg font-bold text-slate-100">Lịch sử studio</h2>
             <div className="flex items-center space-x-3">
               {history.length > 0 && (
                 <>
@@ -468,12 +556,12 @@ const App: React.FC = () => {
                     onClick={handleClearHistory}
                     className="text-[10px] font-bold text-red-500 uppercase hover:text-red-400 transition-colors"
                   >
-                    Xóa
+                    Xóa hết
                   </button>
                 </>
               )}
               <span className="text-xs font-bold text-slate-500 uppercase bg-slate-900 px-2 py-1 rounded border border-white/5">
-                {history.length} Tệp
+                {history.length} Clips
               </span>
             </div>
           </div>
@@ -487,11 +575,18 @@ const App: React.FC = () => {
                   </svg>
                 </div>
                 <h3 className="text-slate-400 font-medium">Chưa có bản ghi nào</h3>
-                <p className="text-slate-500 text-xs mt-1">Hệ thống sẽ tự động nối các phần âm thanh lại thành bản đầy đủ khi hoàn tất.</p>
+                <p className="text-slate-500 text-xs mt-1">Hệ thống sẽ tự động ghép các phần lại khi hoàn tất batch xử lý.</p>
               </div>
             ) : (
               history.map(item => (
-                <AudioCard key={item.id} item={item} onDelete={handleDelete} />
+                <AudioCard 
+                  key={item.id} 
+                  item={item} 
+                  onDelete={handleDelete} 
+                  onRegenerate={handleRegenerate}
+                  isRegenerating={regeneratingId === item.id}
+                  regenerationProgress={regeneratingId === item.id ? regenProgress : 0}
+                />
               ))
             )}
           </div>
@@ -499,7 +594,7 @@ const App: React.FC = () => {
       </main>
 
       <footer className="mt-auto pt-12 text-center text-slate-600 text-xs">
-        <p>&copy; {new Date().getFullYear()} Gemini Voice Studio. Powered by Google Gemini AI.</p>
+        <p>&copy; {new Date().getFullYear()} Gemini Voice Studio - Công nghệ giọng nói Google AI tiên tiến nhất.</p>
       </footer>
     </div>
   );
